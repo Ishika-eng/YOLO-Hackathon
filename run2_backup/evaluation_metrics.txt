@@ -1,0 +1,45 @@
+TRAINING RESULTS
+==================================================
+
+Final Metrics:
+  Final Train Loss:     0.9828
+  Final Val Loss:       0.9096
+  Final Train IoU:      nan
+  Final Val IoU:        0.5387
+  Final Train Dice:     nan
+  Final Val Dice:       0.7326
+  Final Train Accuracy: nan
+  Final Val Accuracy:   0.8617
+==================================================
+
+Best Results:
+  Best Val IoU:      0.5433 (Epoch 19)
+  Best Val Dice:     0.7373 (Epoch 19)
+  Best Val Accuracy: 0.8638 (Epoch 14)
+  Lowest Val Loss:   0.9096 (Epoch 20)
+==================================================
+
+Per-Epoch History:
+----------------------------------------------------------------------------------------------------
+Epoch    Train Loss   Val Loss     Train IoU    Val IoU      Train Dice   Val Dice     Train Acc    Val Acc     
+----------------------------------------------------------------------------------------------------
+1        2.8292       1.6498       nan          0.2967       nan          0.4126       nan          0.7943      
+2        1.7210       1.3369       nan          0.3689       nan          0.5314       nan          0.8290      
+3        1.4804       1.2233       nan          0.4382       nan          0.6322       nan          0.8369      
+4        1.3456       1.1553       nan          0.4448       nan          0.6370       nan          0.8405      
+5        1.2857       1.1223       nan          0.4667       nan          0.6618       nan          0.8447      
+6        1.2420       1.0933       nan          0.4655       nan          0.6604       nan          0.8467      
+7        1.2010       1.0538       nan          0.4777       nan          0.6657       nan          0.8563      
+8        1.1572       1.0202       nan          0.4990       nan          0.6976       nan          0.8537      
+9        1.1277       1.0008       nan          0.5069       nan          0.7102       nan          0.8533      
+10       1.1018       0.9916       nan          0.5101       nan          0.7081       nan          0.8551      
+11       1.0913       0.9696       nan          0.5097       nan          0.7014       nan          0.8589      
+12       1.0594       0.9950       nan          0.5023       nan          0.7001       nan          0.8484      
+13       1.0368       0.9433       nan          0.5230       nan          0.7170       nan          0.8574      
+14       1.0170       0.9398       nan          0.5348       nan          0.7305       nan          0.8638      
+15       1.0331       0.9394       nan          0.5234       nan          0.7151       nan          0.8594      
+16       0.9930       0.9269       nan          0.5375       nan          0.7371       nan          0.8592      
+17       0.9833       1.1101       nan          0.5115       nan          0.7047       nan          0.8565      
+18       0.9952       0.9332       nan          0.5399       nan          0.7369       nan          0.8590      
+19       0.9732       0.9137       nan          0.5433       nan          0.7373       nan          0.8620      
+20       0.9828       0.9096       nan          0.5387       nan          0.7326       nan          0.8617      

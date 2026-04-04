@@ -271,8 +271,8 @@ def main():
                         default=os.path.join(script_dir, 'train_stats', 'best_unet_model.pth'),
                         help='Path to trained model weights')
     parser.add_argument('--data_dir', type=str,
-                        default=os.path.join(script_dir, 'Offroad_Segmentation_testImages'),
-                        help='Path to test dataset directory')
+                        default=os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val'),
+                        help='Path to validation dataset directory')
     parser.add_argument('--output_dir', type=str,
                         default='./predictions',
                         help='Directory to save prediction visualizations')
@@ -348,10 +348,7 @@ def main():
             # Forward pass
             outputs = model(imgs)
 
-            # ── Test-Time Class Suppression ──────────────────────────
-            # Block classes absent/dead in test set:
-            # 0: Background, 2: Lush Bushes, 5: Ground Clutter, 6: Flowers, 7: Logs
-            outputs[:, [0, 2, 5, 6, 7], :, :] = -float('inf')
+            # No class suppression needed for val set (distribution matches train)
 
             labels_squeezed = labels.squeeze(dim=1).long()
             predicted_masks = torch.argmax(outputs, dim=1)

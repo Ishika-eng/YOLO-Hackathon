@@ -289,9 +289,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Image dimensions (must perfectly match training dimensions divisible by 32)
-    w = int(((960 / 2) // 32) * 32)
-    h = int(((540 / 2) // 32) * 32)
+    # Image dimensions (must perfectly match training dimensions)
+    w = 640
+    h = 384
 
     # Transforms
     transform = transforms.Compose([
@@ -347,6 +347,11 @@ def main():
 
             # Forward pass
             outputs = model(imgs)
+
+            # ── Test-Time Class Suppression ──────────────────────────
+            # Block classes absent/dead in test set:
+            # 0: Background, 2: Lush Bushes, 5: Ground Clutter, 6: Flowers, 7: Logs
+            outputs[:, [0, 2, 5, 6, 7], :, :] = -float('inf')
 
             labels_squeezed = labels.squeeze(dim=1).long()
             predicted_masks = torch.argmax(outputs, dim=1)

@@ -76,11 +76,12 @@ def convert_mask(mask):
 # ============================================================================
 
 class MaskDataset(Dataset):
-    def __init__(self, data_dir, transform=None, mask_transform=None):
+    def __init__(self, data_dir, transform=None, mask_transform=None, spatial_augs=None):
         self.image_dir    = os.path.join(data_dir, 'Color_Images')
         self.masks_dir    = os.path.join(data_dir, 'Segmentation')
         self.transform    = transform
         self.mask_transform = mask_transform
+        self.spatial_augs = spatial_augs
         self.data_ids     = os.listdir(self.image_dir)
 
     def __len__(self):
@@ -94,6 +95,12 @@ class MaskDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         mask  = Image.open(msk_path)
         mask  = convert_mask(mask)
+
+        # Apply synchronized spatial and texture augmentations
+        if self.spatial_augs:
+            aug = self.spatial_augs(image=np.array(image), mask=np.array(mask))
+            image = Image.fromarray(aug['image'])
+            mask  = Image.fromarray(aug['mask'])
 
         if self.transform:
             image = self.transform(image)
@@ -326,13 +333,13 @@ def main():
     print(f"Using device: {device}")
 
     # ── Hyperparameters ─────────────────────────────────────────────────────
-    batch_size = 4
+    batch_size = 2
+    grad_accum_steps = 2  # Effective batch_size = 4
     
-    # CHANGED: Ensure input dimensions are divisible by 32 (ResNet34 requirement)
-    w          = int(((960 / 2) // 32) * 32)   # 480
-    h          = int(((540 / 2) // 32) * 32)   # 256
+    # CHANGED: Increased input resolution for robust spatial learning
+    w          = 640
+    h          = 384
     
-    # CHANGED: Updated learning rate for Adam
     lr         = 1e-4
     n_epochs   = 20
 
@@ -342,15 +349,16 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # ── Transforms ──────────────────────────────────────────────────────────
-    # Albumentations texture augmentations for training
-    train_texture_augs = A.Compose([
+    # Albumentations synchronized spatial + texture augmentations
+    train_spatial_augs = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
         A.Sharpen(alpha=(0.2, 0.5), lightness=(0.5, 1.0), p=0.4),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.3, p=0.5),
     ])
 
     train_transform = transforms.Compose([
         transforms.Resize((h, w)),
-        AlbumentationsWrapper(train_texture_augs),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std= [0.229, 0.224, 0.225])
@@ -372,7 +380,7 @@ def main():
     data_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
     val_dir  = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
 
-    trainset     = MaskDataset(data_dir=data_dir, transform=train_transform, mask_transform=mask_transform)
+    trainset     = MaskDataset(data_dir=data_dir, transform=train_transform, mask_transform=mask_transform, spatial_augs=train_spatial_augs)
     train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     valset       = MaskDataset(data_dir=val_dir,  transform=val_transform, mask_transform=mask_transform)
@@ -384,7 +392,8 @@ def main():
     # ── Model Initialization (U-Net) ────────────────────────────────────────
     print("Loading U-Net (ResNet34 encoder)...")
     
-    # CHANGED: Replaced DINOv2 + SegmentationHeadConvNeXt with SMP U-Net
+    # CHANGED: Reverted back to resnet34 because its 87MB weights are already 
+    # permanently cached on your hard drive from Run 1, bypassing the HuggingFace crash!
     model = smp.Unet(
         encoder_name="resnet34",
         encoder_weights="imagenet",
@@ -396,33 +405,34 @@ def main():
 
     # ── Loss, optimizer, scheduler ──────────────────────────────────────────
 
-    # CHANGED: Re-introduced class weights calculated from dataset distribution
-    # Updated heavily based on testing feedback to prioritize Rocks
     class_weights = torch.tensor([
         0.0000,   # 0:  Background      — absent everywhere
-        2.0000,   # 1:  Trees           — rare in test, small boost
-        1.0000,   # 2:  Lush Bushes     — nearly absent in test
-        0.5000,   # 3:  Dry Grass       — stable, no special treatment
-        3.0000,   # 4:  Dry Bushes      — rare in train and test
-        0.5000,   # 5:  Ground Clutter  — absent in test, keep low
-        0.5000,   # 6:  Flowers         — absent in test, keep low
-        3.0000,   # 7:  Logs            — absent in test, keep low
-        8.0000,   # 8:  Rocks           — 15x jump in test, prioritized
-        0.3000,   # 9:  Landscape       — dominant everywhere
-        0.2000,   # 10: Sky             — dominant everywhere
+        2.0000,   # 1:  Trees           
+        1.0000,   # 2:  Lush Bushes     
+        0.5000,   # 3:  Dry Grass       
+        3.0000,   # 4:  Dry Bushes      
+        0.5000,   # 5:  Ground Clutter  
+        0.5000,   # 6:  Flowers         
+        3.0000,   # 7:  Logs            
+        8.0000,   # 8:  Rocks           — highly prioritized
+        0.3000,   # 9:  Landscape       
+        0.2000,   # 10: Sky             
     ], dtype=torch.float32).to(device)
 
-    # CHANGED: Combined DiceLoss and CrossEntropyLoss with weights
-    _dice_loss = smp.losses.DiceLoss(mode='multiclass')
-    _ce_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+    # CHANGED: DiceLoss + FocalLoss (hard-pixel targeting) + weighted CE (class balancing)
+    _dice_loss  = smp.losses.DiceLoss(mode='multiclass')
+    _focal_loss = smp.losses.FocalLoss(mode='multiclass')
+    _ce_loss    = torch.nn.CrossEntropyLoss(weight=class_weights)
     
     def loss_fn(outputs, labels):
-        return _dice_loss(outputs, labels) + _ce_loss(outputs, labels)
+        return _dice_loss(outputs, labels) + _focal_loss(outputs, labels) + _ce_loss(outputs, labels)
 
-    # CHANGED: Using Adam optimizer instead of SGD
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # CHANGED: ReduceLROnPlateau tracks val_iou directly and steps down
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3, verbose=True
+    )
 
     # ── Training history ────────────────────────────────────────────────────
     history = {
@@ -448,19 +458,24 @@ def main():
         train_pbar = tqdm(train_loader,
                           desc=f"Epoch {epoch+1}/{n_epochs} [Train]",
                           leave=False, unit="batch")
-        for imgs, labels in train_pbar:
+        
+        optimizer.zero_grad()
+        
+        for batch_idx, (imgs, labels) in enumerate(train_pbar):
             imgs, labels = imgs.to(device), labels.to(device)
 
-            # CHANGED: Single forward pass through U-Net model
             outputs = model(imgs)
             labels  = labels.squeeze(dim=1).long()
             
-            # CHANGED: Used loss_fn from smp (DiceLoss)
+            # Divide loss dynamically to simulate larger batch size
             loss    = loss_fn(outputs, labels)
+            accum_loss = loss / grad_accum_steps
+            accum_loss.backward()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Execute gradient step only after n steps
+            if ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(train_loader)):
+                optimizer.step()
+                optimizer.zero_grad()
 
             train_losses.append(loss.item())
             train_pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -513,8 +528,11 @@ def main():
         )
 
         # ── Scheduler step ────────────────────────────────────────────────────
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        # Step the plateau scheduler cleanly using validation IoU
+        scheduler.step(val_iou)
+        
+        # Access optimizer's current learning rate cleanly
+        current_lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1} complete | LR: {current_lr:.6e}")
 
         # ── Best-model checkpoint ─────────────────────────────────────────────

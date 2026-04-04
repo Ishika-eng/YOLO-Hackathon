@@ -1,14 +1,12 @@
 """
 Segmentation Validation Script
-Converted from val_mask.ipynb
-Evaluates a trained segmentation head on validation data and saves predictions
+Converted to use U-Net with segmentation_models_pytorch
+Evaluates a trained segmentation model on validation data and saves predictions
 """
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from torch import nn
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 from PIL import Image
@@ -16,6 +14,7 @@ import cv2
 import os
 import argparse
 from tqdm import tqdm
+import segmentation_models_pytorch as smp
 
 # Set matplotlib to non-interactive backend
 plt.switch_backend('Agg')
@@ -40,8 +39,6 @@ def save_image(img, filename):
 # Mask Conversion
 # ============================================================================
 
-# Mapping from raw pixel values to new class IDs
-# FIXED: Added Flowers (600 -> 6), shifted all subsequent classes by 1
 value_map = {
     0: 0,        # Background
     100: 1,      # Trees
@@ -49,15 +46,13 @@ value_map = {
     300: 3,      # Dry Grass
     500: 4,      # Dry Bushes
     550: 5,      # Ground Clutter
-    600: 6,      # Flowers    <- ADDED
-    700: 7,      # Logs       <- was 6
-    800: 8,      # Rocks      <- was 7
-    7100: 9,     # Landscape  <- was 8
-    10000: 10    # Sky        <- was 9
+    600: 6,      # Flowers
+    700: 7,      # Logs
+    800: 8,      # Rocks
+    7100: 9,     # Landscape
+    10000: 10    # Sky
 }
 
-# Class names for visualization (must match value_map order)
-# FIXED: Added 'Flowers' at index 6
 class_names = [
     'Background', 'Trees', 'Lush Bushes', 'Dry Grass', 'Dry Bushes',
     'Ground Clutter', 'Flowers', 'Logs', 'Rocks', 'Landscape', 'Sky'
@@ -65,8 +60,6 @@ class_names = [
 
 n_classes = len(value_map)  # = 11
 
-# Color palette for visualization (11 distinct colors, one per class)
-# FIXED: Added hot pink for Flowers at index 6, shifted others accordingly
 color_palette = np.array([
     [0,   0,   0  ],  # 0  Background    - black
     [34,  139, 34 ],  # 1  Trees         - forest green
@@ -74,7 +67,7 @@ color_palette = np.array([
     [210, 180, 140],  # 3  Dry Grass     - tan
     [139, 90,  43 ],  # 4  Dry Bushes    - brown
     [128, 128, 0  ],  # 5  Ground Clutter- olive
-    [255, 105, 180],  # 6  Flowers       - hot pink  <- ADDED
+    [255, 105, 180],  # 6  Flowers       - hot pink
     [139, 69,  19 ],  # 7  Logs          - saddle brown
     [128, 128, 128],  # 8  Rocks         - gray
     [160, 82,  45 ],  # 9  Landscape     - sienna
@@ -126,42 +119,9 @@ class MaskDataset(Dataset):
 
         if self.transform:
             image = self.transform(image)
-            # FIXED: mask_transform uses NEAREST interpolation (see main()),
-            # so * 255 safely recovers integer class IDs
             mask = self.mask_transform(mask) * 255
 
         return image, mask, data_id
-
-
-# ============================================================================
-# Model: Segmentation Head (ConvNeXt-style) - Must match training exactly
-# ============================================================================
-
-class SegmentationHeadConvNeXt(nn.Module):
-    def __init__(self, in_channels, out_channels, tokenW, tokenH):
-        super().__init__()
-        self.H, self.W = tokenH, tokenW
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=7, padding=3),
-            nn.GELU()
-        )
-
-        self.block = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=7, padding=3, groups=128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=1),
-            nn.GELU(),
-        )
-
-        self.classifier = nn.Conv2d(128, out_channels, 1)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
-        x = self.stem(x)
-        x = self.block(x)
-        return self.classifier(x)
 
 
 # ============================================================================
@@ -308,7 +268,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Segmentation prediction/inference script')
     parser.add_argument('--model_path', type=str,
-                        default=os.path.join(script_dir, 'train_stats', 'best_segmentation_head.pth'),
+                        default=os.path.join(script_dir, 'train_stats', 'best_unet_model.pth'),
                         help='Path to trained model weights')
     parser.add_argument('--data_dir', type=str,
                         default=os.path.join(script_dir, 'Offroad_Segmentation_testImages'),
@@ -316,7 +276,7 @@ def main():
     parser.add_argument('--output_dir', type=str,
                         default='./predictions',
                         help='Directory to save prediction visualizations')
-    parser.add_argument('--batch_size', type=int, default=2,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for evaluation')
     parser.add_argument('--num_samples', type=int, default=5,
                         help='Number of comparison visualizations to save')
@@ -329,9 +289,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Image dimensions (must match training exactly)
-    w = int(((960 / 2) // 14) * 14)
-    h = int(((540 / 2) // 14) * 14)
+    # Image dimensions (must perfectly match training dimensions divisible by 32)
+    w = int(((960 / 2) // 32) * 32)
+    h = int(((540 / 2) // 32) * 32)
 
     # Transforms
     transform = transforms.Compose([
@@ -352,42 +312,17 @@ def main():
     val_loader = DataLoader(valset, batch_size=args.batch_size, shuffle=False)
     print(f"Loaded {len(valset)} samples")
 
-    # Load DINOv2 backbone
-    print("Loading DINOv2 backbone...")
-    BACKBONE_SIZE = "small"
-    backbone_archs = {
-        "small": "vits14",
-        "base": "vitb14_reg",
-        "large": "vitl14_reg",
-        "giant": "vitg14_reg",
-    }
-    backbone_arch = backbone_archs[BACKBONE_SIZE]
-    backbone_name = f"dinov2_{backbone_arch}"
-
-    backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.eval()
-    backbone_model.to(device)
-    print("Backbone loaded successfully!")
-
-    # Get embedding dimension
-    sample_img, _, _ = valset[0]
-    sample_img = sample_img.unsqueeze(0).to(device)
-    with torch.no_grad():
-        output = backbone_model.forward_features(sample_img)["x_norm_patchtokens"]
-    n_embedding = output.shape[2]
-    print(f"Embedding dimension: {n_embedding}")
-
-    # Load classifier
-    print(f"Loading model from {args.model_path}...")
-    classifier = SegmentationHeadConvNeXt(
-        in_channels=n_embedding,
-        out_channels=n_classes,   # 11 classes
-        tokenW=w // 14,
-        tokenH=h // 14
+    # Load U-Net model
+    print(f"Loading U-Net model from {args.model_path}...")
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=n_classes
     )
-    classifier.load_state_dict(torch.load(args.model_path, map_location=device))
-    classifier = classifier.to(device)
-    classifier.eval()
+    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model = model.to(device)
+    model.eval()
     print("Model loaded successfully!")
 
     # Create subdirectories for outputs
@@ -411,9 +346,7 @@ def main():
             imgs, labels = imgs.to(device), labels.to(device)
 
             # Forward pass
-            output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-            logits = classifier(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:], mode="bilinear", align_corners=False)
+            outputs = model(imgs)
 
             labels_squeezed = labels.squeeze(dim=1).long()
             predicted_masks = torch.argmax(outputs, dim=1)

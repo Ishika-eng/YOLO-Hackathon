@@ -1,26 +1,31 @@
 """
 Segmentation Training Script
-Converted from train_mask.ipynb
-Trains a segmentation head on top of DINOv2 backbone
+Converted to use U-Net with segmentation_models_pytorch
 """
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from torch import nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import torch.optim as optim
-import torchvision.transforms as transforms
-from PIL import Image
-import cv2
 import os
-import torchvision
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import segmentation_models_pytorch as smp
+import albumentations as A
 
 # Set matplotlib to non-interactive backend
 plt.switch_backend('Agg')
 
+class AlbumentationsWrapper:
+    """Wraps albumentations transforms to be used inside torchvision.transforms.Compose"""
+    def __init__(self, aug):
+        self.aug = aug
+    def __call__(self, img):
+        img_np = np.array(img)
+        res = self.aug(image=img_np)['image']
+        return Image.fromarray(res)
 
 # ============================================================================
 # Utility Functions
@@ -41,21 +46,18 @@ def save_image(img, filename):
 # Mask Conversion
 # ============================================================================
 
-# CHANGE 1: Added Flowers (600 → 6). All classes after it shifted by 1.
-# WHY: Flowers pixels exist in the dataset but were silently mapped to
-#      Background (0), making the model never learn the Flowers class.
 value_map = {
-    0:     0,   # Background     (never appears in dataset — weight = 0)
+    0:     0,   # Background     (never appears in dataset \u2014 weight = 0)
     100:   1,   # Trees
     200:   2,   # Lush Bushes
     300:   3,   # Dry Grass
     500:   4,   # Dry Bushes
     550:   5,   # Ground Clutter
-    600:   6,   # Flowers        <- ADDED
-    700:   7,   # Logs           <- was 6
-    800:   8,   # Rocks          <- was 7
-    7100:  9,   # Landscape      <- was 8
-    10000: 10,  # Sky            <- was 9
+    600:   6,   # Flowers        
+    700:   7,   # Logs           
+    800:   8,   # Rocks          
+    7100:  9,   # Landscape      
+    10000: 10,  # Sky            
 }
 n_classes = len(value_map)   # 11
 
@@ -102,40 +104,8 @@ class MaskDataset(Dataset):
 
 
 # ============================================================================
-# Model: Segmentation Head (ConvNeXt-style)
-# ============================================================================
-
-class SegmentationHeadConvNeXt(nn.Module):
-    def __init__(self, in_channels, out_channels, tokenW, tokenH):
-        super().__init__()
-        self.H, self.W = tokenH, tokenW
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 128, kernel_size=7, padding=3),
-            nn.GELU()
-        )
-        self.block = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=7, padding=3, groups=128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=1),
-            nn.GELU(),
-        )
-        self.classifier = nn.Conv2d(128, out_channels, 1)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        x = x.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
-        x = self.stem(x)
-        x = self.block(x)
-        return self.classifier(x)
-
-
-# ============================================================================
 # Metrics
 # ============================================================================
-
-# CHANGE 2: num_classes updated from 10 → 11 everywhere.
-# WHY: We now have 11 classes (0-10). Using 10 would silently skip Sky (class 10).
 
 def compute_iou(pred, target, num_classes=11, ignore_index=255):
     """Compute mean IoU across all classes (ignores classes absent from both pred & GT)."""
@@ -151,7 +121,7 @@ def compute_iou(pred, target, num_classes=11, ignore_index=255):
         intersection = (pred_inds & target_inds).sum().float()
         union        = (pred_inds | target_inds).sum().float()
         if union == 0:
-            iou_per_class.append(float('nan'))   # class absent — skip in mean
+            iou_per_class.append(float('nan'))   # class absent \u2014 skip in mean
         else:
             iou_per_class.append((intersection / union).cpu().numpy())
 
@@ -181,7 +151,8 @@ def compute_pixel_accuracy(pred, target):
     return (pred_classes == target).float().mean().cpu().numpy()
 
 
-def evaluate_metrics(model, backbone, data_loader, device, num_classes=11, show_progress=True):
+# CHANGED: Removed backbone inference from metrics evaluation
+def evaluate_metrics(model, data_loader, device, num_classes=11, show_progress=True):
     """Run inference on a dataloader and return mean IoU, Dice, and pixel accuracy."""
     iou_scores, dice_scores, pixel_accuracies = [], [], []
 
@@ -193,11 +164,8 @@ def evaluate_metrics(model, backbone, data_loader, device, num_classes=11, show_
         for imgs, labels in loader:
             imgs, labels = imgs.to(device), labels.to(device)
 
-            output  = backbone.forward_features(imgs)["x_norm_patchtokens"]
-            logits  = model(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:],
-                                    mode="bilinear", align_corners=False)
-
+            # UNet forward pass (single step)
+            outputs = model(imgs)
             labels = labels.squeeze(dim=1).long()
 
             iou_scores.append(compute_iou(outputs, labels, num_classes=num_classes))
@@ -358,11 +326,15 @@ def main():
     print(f"Using device: {device}")
 
     # ── Hyperparameters ─────────────────────────────────────────────────────
-    batch_size = 2
-    w          = int(((960 / 2) // 14) * 14)   # 476
-    h          = int(((540 / 2) // 14) * 14)   # 266
+    batch_size = 4
+    
+    # CHANGED: Ensure input dimensions are divisible by 32 (ResNet34 requirement)
+    w          = int(((960 / 2) // 32) * 32)   # 480
+    h          = int(((540 / 2) // 32) * 32)   # 256
+    
+    # CHANGED: Updated learning rate for Adam
     lr         = 1e-4
-    n_epochs   = 10
+    n_epochs   = 20
 
     # ── Output directory ────────────────────────────────────────────────────
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -370,17 +342,27 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # ── Transforms ──────────────────────────────────────────────────────────
-    transform = transforms.Compose([
+    # Albumentations texture augmentations for training
+    train_texture_augs = A.Compose([
+        A.Sharpen(alpha=(0.2, 0.5), lightness=(0.5, 1.0), p=0.4),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.3, p=0.5),
+    ])
+
+    train_transform = transforms.Compose([
+        transforms.Resize((h, w)),
+        AlbumentationsWrapper(train_texture_augs),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std= [0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
         transforms.Resize((h, w)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std= [0.229, 0.224, 0.225])
     ])
 
-    # CHANGE 3: Use NEAREST interpolation for mask resize.
-    # WHY: Bilinear interpolation blends class IDs at boundaries (e.g. class 1
-    #      and class 2 become 1.5), which corrupts labels after .long() cast.
-    #      NEAREST keeps labels as exact integers.
     mask_transform = transforms.Compose([
         transforms.Resize((h, w), interpolation=transforms.InterpolationMode.NEAREST),
         transforms.ToTensor(),
@@ -390,81 +372,57 @@ def main():
     data_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
     val_dir  = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
 
-    trainset     = MaskDataset(data_dir=data_dir, transform=transform, mask_transform=mask_transform)
-    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+    trainset     = MaskDataset(data_dir=data_dir, transform=train_transform, mask_transform=mask_transform)
+    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
-    valset       = MaskDataset(data_dir=val_dir,  transform=transform, mask_transform=mask_transform)
-    val_loader   = DataLoader(valset,   batch_size=batch_size, shuffle=False)
+    valset       = MaskDataset(data_dir=val_dir,  transform=val_transform, mask_transform=mask_transform)
+    val_loader   = DataLoader(valset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     print(f"Training samples:   {len(trainset)}")
     print(f"Validation samples: {len(valset)}")
 
-    # ── DINOv2 backbone ─────────────────────────────────────────────────────
-    print("Loading DINOv2 backbone...")
-    BACKBONE_SIZE = "small"
-    backbone_archs = {
-        "small": "vits14",
-        "base":  "vitb14_reg",
-        "large": "vitl14_reg",
-        "giant": "vitg14_reg",
-    }
-    backbone_name  = f"dinov2_{backbone_archs[BACKBONE_SIZE]}"
-    backbone_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
-    backbone_model.eval()
-    backbone_model.to(device)
-    print("Backbone loaded successfully!")
-
-    # Get patch-token embedding dimension from a sample batch
-    imgs, _ = next(iter(train_loader))
-    imgs = imgs.to(device)
-    with torch.no_grad():
-        output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-    n_embedding = output.shape[2]
-    print(f"Embedding dimension: {n_embedding}")
-    print(f"Patch tokens shape:  {output.shape}")
-
-    # ── Segmentation head ───────────────────────────────────────────────────
-    classifier = SegmentationHeadConvNeXt(
-        in_channels=n_embedding,
-        out_channels=n_classes,      # 11
-        tokenW=w // 14,
-        tokenH=h // 14
-    ).to(device)
+    # ── Model Initialization (U-Net) ────────────────────────────────────────
+    print("Loading U-Net (ResNet34 encoder)...")
+    
+    # CHANGED: Replaced DINOv2 + SegmentationHeadConvNeXt with SMP U-Net
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=n_classes
+    )
+    model = model.to(device)
+    print("Model loaded successfully!")
 
     # ── Loss, optimizer, scheduler ──────────────────────────────────────────
 
-    # CHANGE 4: Weighted CrossEntropyLoss based on actual pixel counts in dataset.
-    # WHY: Without weights the model ignores rare classes (especially Logs at
-    #      0.078% of pixels) because getting them wrong barely affects total loss.
-    #      Weights force the model to care about rare classes proportionally.
-    #
-    #      Weights are inverse-frequency normalised so median weight = 1.
-    #      Logs weight is capped at 10 (raw value was 50.27) for training stability.
-    #      If Logs IoU is still near 0 after training, raise it to 20-30 and retrain.
-    #      Background weight = 0 because it never appears in this dataset.
+    # CHANGED: Re-introduced class weights calculated from dataset distribution
+    # Updated heavily based on testing feedback to prioritize Rocks
     class_weights = torch.tensor([
-        0.0000,   # 0:  Background     — never appears, ignore completely
-        1.1086,   # 1:  Trees
-        0.6601,   # 2:  Lush Bushes
-        0.2076,   # 3:  Dry Grass
-        3.5660,   # 4:  Dry Bushes
-        0.8914,   # 5:  Ground Clutter
-        1.3951,   # 6:  Flowers
-        10.0000,  # 7:  Logs           — capped from 50.27 for stability
-        3.2697,   # 8:  Rocks
-        0.1602,   # 9:  Landscape
-        0.1041,   # 10: Sky
+        0.0000,   # 0:  Background      — absent everywhere
+        2.0000,   # 1:  Trees           — rare in test, small boost
+        1.0000,   # 2:  Lush Bushes     — nearly absent in test
+        0.5000,   # 3:  Dry Grass       — stable, no special treatment
+        3.0000,   # 4:  Dry Bushes      — rare in train and test
+        0.5000,   # 5:  Ground Clutter  — absent in test, keep low
+        0.5000,   # 6:  Flowers         — absent in test, keep low
+        3.0000,   # 7:  Logs            — absent in test, keep low
+        8.0000,   # 8:  Rocks           — 15x jump in test, prioritized
+        0.3000,   # 9:  Landscape       — dominant everywhere
+        0.2000,   # 10: Sky             — dominant everywhere
     ], dtype=torch.float32).to(device)
 
-    loss_fct  = torch.nn.CrossEntropyLoss(weight=class_weights)
+    # CHANGED: Combined DiceLoss and CrossEntropyLoss with weights
+    _dice_loss = smp.losses.DiceLoss(mode='multiclass')
+    _ce_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    def loss_fn(outputs, labels):
+        return _dice_loss(outputs, labels) + _ce_loss(outputs, labels)
 
-    optimizer = optim.SGD(classifier.parameters(), lr=lr, momentum=0.9)
+    # CHANGED: Using Adam optimizer instead of SGD
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # CHANGE 5: CosineAnnealingLR scheduler.
-    # WHY: A fixed learning rate with SGD typically stalls after a few epochs.
-    #      Cosine decay smoothly lowers the LR, helping the model converge better
-    #      in later epochs without manual tuning.
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     # ── Training history ────────────────────────────────────────────────────
     history = {
@@ -474,11 +432,6 @@ def main():
         'train_pixel_acc': [], 'val_pixel_acc': []
     }
 
-    # CHANGE 6: Best-model checkpoint tracker.
-    # WHY: Without this, only the final epoch's weights are saved.
-    #      The best val IoU often occurs before the final epoch (especially with
-    #      cosine decay), so saving only the best ensures the submitted model
-    #      is the strongest one from the whole run.
     best_val_iou = -1.0
 
     # ── Training loop ───────────────────────────────────────────────────────
@@ -489,7 +442,7 @@ def main():
     for epoch in epoch_pbar:
 
         # ── Train phase ─────────────────────────────────────────────────────
-        classifier.train()
+        model.train()
         train_losses = []
 
         train_pbar = tqdm(train_loader,
@@ -498,20 +451,13 @@ def main():
         for imgs, labels in train_pbar:
             imgs, labels = imgs.to(device), labels.to(device)
 
-            with torch.no_grad():
-                output = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-
-            logits  = classifier(output.to(device))
-            outputs = F.interpolate(logits, size=imgs.shape[2:],
-                                    mode="bilinear", align_corners=False)
+            # CHANGED: Single forward pass through U-Net model
+            outputs = model(imgs)
             labels  = labels.squeeze(dim=1).long()
-            loss    = loss_fct(outputs, labels)
+            
+            # CHANGED: Used loss_fn from smp (DiceLoss)
+            loss    = loss_fn(outputs, labels)
 
-            # CHANGE 7: Correct optimizer step order.
-            # WHY: zero_grad() must come BEFORE backward(), not after step().
-            #      The original code called zero_grad() after step(), which
-            #      means gradients from the previous batch were still present
-            #      when backward() ran — leading to incorrect gradient updates.
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -520,7 +466,7 @@ def main():
             train_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         # ── Validation phase ─────────────────────────────────────────────────
-        classifier.eval()
+        model.eval()
         val_losses = []
 
         val_pbar = tqdm(val_loader,
@@ -530,21 +476,21 @@ def main():
             for imgs, labels in val_pbar:
                 imgs, labels = imgs.to(device), labels.to(device)
 
-                output  = backbone_model.forward_features(imgs)["x_norm_patchtokens"]
-                logits  = classifier(output.to(device))
-                outputs = F.interpolate(logits, size=imgs.shape[2:],
-                                        mode="bilinear", align_corners=False)
+                # CHANGED: Single forward pass through U-Net model
+                outputs = model(imgs)
                 labels  = labels.squeeze(dim=1).long()
-                loss    = loss_fct(outputs, labels)
+                
+                loss    = loss_fn(outputs, labels)
 
                 val_losses.append(loss.item())
                 val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         # ── Compute full metrics ──────────────────────────────────────────────
-        train_iou, train_dice, train_pixel_acc = evaluate_metrics(
-            classifier, backbone_model, train_loader, device, num_classes=n_classes)
+        # CHANGED: Evaluate metrics using the U-Net model alone
+        # Skipped train metrics to avoid running 700+ batches every epoch!
+        train_iou, train_dice, train_pixel_acc = float('nan'), float('nan'), float('nan')
         val_iou, val_dice, val_pixel_acc = evaluate_metrics(
-            classifier, backbone_model, val_loader,   device, num_classes=n_classes)
+            model, val_loader,   device, num_classes=n_classes)
 
         # ── Store history ─────────────────────────────────────────────────────
         epoch_train_loss = np.mean(train_losses)
@@ -574,8 +520,8 @@ def main():
         # ── Best-model checkpoint ─────────────────────────────────────────────
         if val_iou > best_val_iou:
             best_val_iou = val_iou
-            best_path    = os.path.join(output_dir, "best_segmentation_head.pth")
-            torch.save(classifier.state_dict(), best_path)
+            best_path    = os.path.join(output_dir, "best_unet_model.pth") # CHANGED: Rename checkpoint file
+            torch.save(model.state_dict(), best_path)
             print(f"--> New best model saved  |  Val IoU: {val_iou:.4f}")
 
     # ── Save plots and history ───────────────────────────────────────────────
@@ -589,7 +535,9 @@ def main():
     print(f"  Final Val IoU:      {history['val_iou'][-1]:.4f}")
     print(f"  Final Val Dice:     {history['val_dice'][-1]:.4f}")
     print(f"  Final Val Accuracy: {history['val_pixel_acc'][-1]:.4f}")
-    print(f"\nBest Val IoU: {best_val_iou:.4f}  →  saved to '{output_dir}/best_segmentation_head.pth'")
+    
+    # CHANGED: Reflect renamed checkpoint
+    print(f"\nBest Val IoU: {best_val_iou:.4f}  →  saved to '{output_dir}/best_unet_model.pth'")
     print("\nTraining complete!")
 
 

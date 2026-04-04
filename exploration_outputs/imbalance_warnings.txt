@@ -1,0 +1,20 @@
+IMBALANCE & DRIFT ANALYSIS
+============================================================
+
+[i] MINOR  | Class 1 (Trees): Delta = 3.80% -- Val (4.07%) vs Test (0.27%)
+[!] DRIFT  | Class 2 (Lush Bushes): Delta = 6.01% -- Val (6.02%) vs Test (0.00%)
+[i] MINOR  | Class 5 (Ground Clutter): Delta = 4.39% -- Train (4.39%) vs Test (0.00%)
+[i] MINOR  | Class 6 (Flowers): Delta = 2.81% -- Train (2.81%) vs Test (0.00%)
+[!] DRIFT  | Class 8 (Rocks): Delta = 16.94% -- Test (18.14%) vs Train (1.20%)
+[!] DRIFT  | Class 9 (Landscape): Delta = 19.42% -- Test (43.18%) vs Val (23.77%)
+[!] DRIFT  | Class 10 (Sky): Delta = 19.79% -- Val (37.75%) vs Test (17.96%)
+[X] ABSENT | Class 0 (Background): 0 pixels in Train
+[X] ABSENT | Class 0 (Background): 0 pixels in Val
+[X] ABSENT | Class 0 (Background): 0 pixels in Test
+[!] RARE   | Class 1 (Trees): only 0.269% in Test
+[!] RARE   | Class 2 (Lush Bushes): only 0.001% in Test
+[X] ABSENT | Class 5 (Ground Clutter): 0 pixels in Test
+[X] ABSENT | Class 6 (Flowers): 0 pixels in Test
+[!] RARE   | Class 7 (Logs): only 0.078% in Train
+[!] RARE   | Class 7 (Logs): only 0.067% in Val
+[X] ABSENT | Class 7 (Logs): 0 pixels in Test
